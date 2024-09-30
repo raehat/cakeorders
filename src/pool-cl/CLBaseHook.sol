@@ -23,7 +23,7 @@ import {BeforeSwapDelta} from "pancake-v4-core/src/types/BeforeSwapDelta.sol";
 import {IHooks} from "pancake-v4-core/src/interfaces/IHooks.sol";
 import {IVault} from "pancake-v4-core/src/interfaces/IVault.sol";
 import {ICLHooks} from "pancake-v4-core/src/pool-cl/interfaces/ICLHooks.sol";
-import {ICLPoolManager} from "pancake-v4-core/src/pool-cl/interfaces/ICLPoolManager.sol";
+import {ICLPoolManager} from "./ICLPoolManager.sol";
 import {CLPoolManager} from "pancake-v4-core/src/pool-cl/CLPoolManager.sol";
 
 abstract contract CLBaseHook is ICLHooks {
@@ -49,6 +49,95 @@ abstract contract CLBaseHook is ICLHooks {
         bool afterSwapReturnsDelta;
         bool afterAddLiquidityReturnsDelta;
         bool afterRemoveLiquidityReturnsDelta;
+    }
+
+    enum OrderType {
+        STOP_LOSS,
+        BUY_STOP,
+        BUY_LIMIT,
+        TAKE_PROFIT
+    }
+    enum OrderStatus {
+        OPEN,
+        EXECUTED,
+        CANCELED
+    }
+
+    struct Order {
+        bytes32 id;
+        address user;
+        OrderType orderType;
+        uint256 amountIn;
+        int24 triggerTick;
+        OrderStatus status;
+        bool zeroForOne;
+    }
+
+    uint256 public orderCount;
+    PoolKey public poolKey;
+    mapping(bytes32 => Order) public orders;
+    mapping(int24 tick => mapping(bool zeroForOne => Order[])) public orderPositions;
+    mapping(PoolId => int24) public tickLowerLasts;
+    mapping(address userAddress => Order[]) public userOrders;
+
+    event OrderPlaced(
+        bytes32 indexed orderId, address indexed user, OrderType orderType, uint256 amountIn, int24 triggerPrice
+    );
+    event OrderExecuted(
+        bytes32 indexed orderId, address indexed user, OrderType orderType, uint256 amountIn, int24 triggerPrice
+    );
+    event OrderCanceled(bytes32 indexed orderId, address indexed user, OrderType orderType);
+
+    event OrdersProcessed(bytes32[] orderIds);
+
+    function placeOrder(
+        OrderType orderType,
+        uint256 amountIn,
+        int24 _triggerTick,
+        PoolKey calldata _poolKey,
+        int24 tickLower
+    ) external returns (bytes32 orderId) {
+        require(amountIn > 0, "Amount must be greater than 0");
+
+        orderId = keccak256(abi.encodePacked(orderCount, msg.sender, block.timestamp));
+        bool zeroForOne = (orderType == OrderType.BUY_STOP) || (orderType == OrderType.STOP_LOSS);
+        orders[orderId] = Order({
+            id: orderId,
+            user: msg.sender,
+            orderType: orderType,
+            amountIn: amountIn,
+            triggerTick: _triggerTick,
+            status: OrderStatus.OPEN,
+            zeroForOne: zeroForOne
+        });
+        int24 tick = getTickLower(tickLower, _poolKey.tickSpacing);
+        orderPositions[tick][zeroForOne].push(orders[orderId]);
+        userOrders[msg.sender].push(orders[orderId]);
+        orderCount++;
+
+        // Transfer token0 to this contract
+        address token = zeroForOne ? Currency.unwrap(_poolKey.currency0) : Currency.unwrap(_poolKey.currency1);
+        IERC20(token).transferFrom(msg.sender, address(this), amountIn);
+        emit OrderPlaced(orderId, msg.sender, orderType, amountIn, _triggerTick);
+    }
+
+    function getOrder(bytes32 orderId) external view returns (Order memory) {
+        return orders[orderId];
+    }
+
+    function cancelOrder(bytes32 orderId) external {
+        Order storage order = orders[orderId];
+        require(order.user == msg.sender, "Only the order creator can cancel the order");
+        require(order.status == OrderStatus.OPEN, "Order can only be canceled if it is open");
+
+        // Update order status to canceled
+        order.status = OrderStatus.CANCELED;
+
+        // Transfer the tokens back to the user
+        address token = order.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
+        IERC20(token).transfer(order.user, order.amountIn);
+
+        emit OrderCanceled(orderId, msg.sender, order.orderType);
     }
 
     /// @notice The address of the pool manager
@@ -117,7 +206,7 @@ abstract contract CLBaseHook is ICLHooks {
         ICLPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) external virtual returns (bytes4) {
-        revert HookNotImplemented();
+
     }
 
     function afterAddLiquidity(
@@ -162,7 +251,84 @@ abstract contract CLBaseHook is ICLHooks {
         virtual
         returns (bytes4, int128)
     {
-        revert HookNotImplemented();
+        int24 prevTick = tickLowerLasts[key.toId()];
+        int24 tick = getTick(key.toId());
+        int24 currentTick = getTickLower(tick, key.tickSpacing);
+        tick = prevTick;
+
+        Order[] memory validOrders;
+        // fill orders in the opposite direction of the swap
+        bool orderZeroForOne = !params.zeroForOne;
+
+        if (prevTick < currentTick) {
+            for (; tick < currentTick;) {
+                validOrders = orderPositions[tick][orderZeroForOne];
+
+                bytes32[] memory orderIds = new bytes32[](validOrders.length);
+                uint256 index = 0;
+                for (uint256 i = 0; i < validOrders.length; i++) {
+                    orderIds[index] = validOrders[i].id;
+                    index++;
+                }
+                if (orderIds.length > 0) {
+                    emit OrdersProcessed(orderIds);
+                }
+                unchecked {
+                    tick += key.tickSpacing;
+                }
+            }
+        } else {
+            for (; currentTick < tick;) {
+                validOrders = orderPositions[tick][orderZeroForOne];
+                bytes32[] memory orderIds = new bytes32[](validOrders.length);
+                uint256 index = 0;
+                for (uint256 i = 0; i < validOrders.length; i++) {
+                    orderIds[index] = validOrders[i].id;
+                    index++;
+                }
+                if (orderIds.length > 0) {
+                    emit OrdersProcessed(orderIds);
+                }
+                unchecked {
+                    tick -= key.tickSpacing;
+                }
+            }
+        }
+        return (AdvancedOrders.afterSwap.selector, 0);
+    }
+
+    function settleOrder(bytes32 orderId, bytes calldata _extraData) external {
+        // TODO: add modifier
+        Order storage order = orders[orderId];
+        int24 currentTick = getTick(poolKey.toId());
+
+        if (!shouldExecuteOrder(order, currentTick)) {
+            revert("order can not be filled");
+        }
+
+        address tokenIn = !order.zeroForOne ? Currency.unwrap(poolKey.currency1) : Currency.unwrap(poolKey.currency0);
+        address tokenOut = !order.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
+        IERC20(tokenIn).transfer(msg.sender, order.amountIn);
+
+        (bool success,) = msg.sender.call(
+            abi.encodeWithSignature("settleCallback(address,address,bytes)", tokenIn, tokenOut, _extraData)
+        );
+
+        order.status = OrderStatus.EXECUTED;
+        IERC20(tokenOut).transfer(order.user, IERC20(tokenOut).balanceOf(address(this)));
+    }
+
+    function shouldExecuteOrder(Order storage order, int24 currentTick) internal view returns (bool) {
+        if (order.orderType == OrderType.STOP_LOSS && currentTick <= order.triggerTick) {
+            return true;
+        } else if (order.orderType == OrderType.BUY_STOP && currentTick >= order.triggerTick) {
+            return true;
+        } else if (order.orderType == OrderType.BUY_LIMIT && currentTick <= order.triggerTick) {
+            return true;
+        } else if (order.orderType == OrderType.TAKE_PROFIT && currentTick >= order.triggerTick) {
+            return true;
+        }
+        return false;
     }
 
     function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
